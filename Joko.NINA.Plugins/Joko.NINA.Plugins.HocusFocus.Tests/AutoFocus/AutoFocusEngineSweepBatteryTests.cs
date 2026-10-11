@@ -641,6 +641,52 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.AutoFocus {
         }
 
         // ------------------------------------------------------------------------------------------------------------
+        // A shallow curve can bracket the hyperbola while leaving only one usable point on a trend wing.
+        // The default line is not a fit, even when quality thresholds are disabled. Drive the real engine
+        // through rejection and position restoration rather than merely checking the combination helper.
+        [TestCase(AFCurveFittingEnum.TRENDHYPERBOLIC)]
+        [TestCase(AFCurveFittingEnum.TRENDPARABOLIC)]
+        public async Task CombinedFit_MissingTrendWing_RestoresStartWithoutHalfPositionMove(AFCurveFittingEnum fitting) {
+            const int focus = 26884;
+            var scenario = new DegradationScenario(focus, 5) {
+                BaselineHfr = pos => Math.Sqrt(1.4 * 1.4 + Math.Pow(0.02 * (pos - focus), 2.0))
+            };
+            var options = DefaultSweepOptions(scenario, offsetSteps: 4);
+            options.AutoFocusCurveFitting = fitting;
+            options.MaxOutlierRejections = 0;
+            var harness = BuildHarness(scenario, options, focus, focuserMin: 0, focuserMax: 60000);
+            var result = await RunSweep(harness, options);
+
+            Assert.Multiple(() => {
+                Assert.That(result.Succeeded, Is.False, "missing trend wings must reject a combined fit");
+                Assert.That(result.RegionResults[0].Fittings.TrendlineFitting.RightTrend.DataPoints.Count(), Is.LessThan(2),
+                    "exercise an unfit default wing from NINA's trend fitter");
+                Assert.That(harness.Focuser.MoveHistory, Has.All.InRange(focus - 200, focus + 200),
+                    "neither final validation nor a calculated-point retry may chase the zero sentinel");
+                Assert.That(harness.Focuser.Position, Is.EqualTo(focus), "failed autofocus restores its true start");
+            });
+        }
+
+        [Test]
+        public async Task FinalWindowRefit_PoorLocalFit_IsRejectedByFinalQualityGate() {
+            var scenario = new DegradationScenario(Focus, StepSize) {
+                BaselineHfr = pos => Math.Sqrt(1.4 * 1.4 + Math.Pow(0.02 * (pos - Focus), 2.0)) +
+                    (Math.Abs(pos - Focus) <= 20 ? 0.06 * Math.Cos((pos - Focus) * Math.PI / 10) : 0)
+            };
+            var options = DefaultSweepOptions(scenario, offsetSteps: 4);
+            options.MaxOutlierRejections = 0;
+            var harness = BuildHarness(scenario, options, Focus, Focus - 5000, Focus + 5000, rSquaredThreshold: 0.7);
+            var result = await RunSweep(harness, options);
+
+            Assert.Multiple(() => {
+                Assert.That(result.RegionResults[0].WindowExcludedPoints, Is.Not.Empty, "quality must be checked after refitting");
+                Assert.That(result.RegionResults[0].Fittings.HyperbolicFitting.RSquared, Is.LessThan(0.7),
+                    "exercise a final fit below the configured threshold");
+                Assert.That(result.Succeeded, Is.False, "the provisional fit cannot authorize a worse final fit");
+                Assert.That(harness.Focuser.Position, Is.EqualTo(Focus), "failed autofocus restores its true start");
+            });
+        }
+
         // Reusable harness construction — the battery builds every scenario on top of these helpers.
         // ------------------------------------------------------------------------------------------------------------
 
@@ -727,7 +773,8 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.AutoFocus {
         /// <paramref name="options"/> (STARHFR + HYPERBOLIC — both the DTO and the profile must agree, since finalization
         /// reads the profile). Everything else is a bare NSubstitute.
         /// </summary>
-        internal static SweepHarness BuildHarness(DegradationScenario scenario, AutoFocusEngineOptions options, int startPosition, int focuserMin, int focuserMax) {
+        internal static SweepHarness BuildHarness(DegradationScenario scenario, AutoFocusEngineOptions options, int startPosition,
+            int focuserMin, int focuserMax, double rSquaredThreshold = 0) {
             var focuser = new MovingFocuserMediator(startPosition, focuserMin, focuserMax);
             var ledger = new SweepFrameLedger();
             var imaging = new StampedImagingMediator(focuser, ledger);
@@ -747,6 +794,7 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.AutoFocus {
             // with the DTO. R²/χ² thresholds default to 0 ⇒ no fit-quality rejection of a clean fit.
             profileService.ActiveProfile.FocuserSettings.AutoFocusMethod.Returns(options.AutoFocusMethod);
             profileService.ActiveProfile.FocuserSettings.AutoFocusCurveFitting.Returns(options.AutoFocusCurveFitting);
+            profileService.ActiveProfile.FocuserSettings.RSquaredThreshold.Returns(rSquaredThreshold);
 
             var engine = new AutoFocusEngine(
                 profileService: profileService,

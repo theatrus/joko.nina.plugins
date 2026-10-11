@@ -420,7 +420,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
 
                     if (method == AFMethodEnum.STARHFR) {
                         if (fitting == AFCurveFittingEnum.TRENDLINES) {
-                            return Fittings.TrendlineFitting?.Intersection;
+                            return GetValidTrendIntersection(Fittings.TrendlineFitting);
                         }
 
                         if (fitting == AFCurveFittingEnum.HYPERBOLIC) {
@@ -436,7 +436,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                                 return null;
                             }
 
-                            return new DataPoint(Math.Round((Fittings.TrendlineFitting.Intersection.X + Fittings.QuadraticFitting.Minimum.X) / 2), (Fittings.TrendlineFitting.Intersection.Y + Fittings.QuadraticFitting.Minimum.Y) / 2);
+                            return CombineTrendMinimum(Fittings.TrendlineFitting, Fittings.QuadraticFitting.Minimum);
                         }
 
                         if (fitting == AFCurveFittingEnum.TRENDHYPERBOLIC) {
@@ -444,7 +444,7 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                                 return null;
                             }
 
-                            return new DataPoint(Math.Round((Fittings.TrendlineFitting.Intersection.X + Fittings.HyperbolicFitting.Minimum.X) / 2), (Fittings.TrendlineFitting.Intersection.Y + Fittings.HyperbolicFitting.Minimum.Y) / 2);
+                            return CombineTrendMinimum(Fittings.TrendlineFitting, Fittings.HyperbolicFitting.Minimum);
                         }
 
                         Logger.Error($"Invalid AutoFocus Fitting {fitting} for method {method}");
@@ -521,6 +521,41 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             }
         }
 
+        internal static DataPoint? GetValidTrendIntersection(TrendlineFitting fitting) {
+            var left = fitting?.LeftTrend;
+            var right = fitting?.RightTrend;
+            // NINA returns (0, 0) for parallel lines, including the default lines created when a wing has fewer
+            // than two points. Such a sentinel is not a focus estimate and must never be averaged with a vertex.
+            if (left?.DataPoints == null || right?.DataPoints == null ||
+                left.DataPoints.Count() < 2 || right.DataPoints.Count() < 2 ||
+                !double.IsFinite(left.Slope) || !double.IsFinite(right.Slope) ||
+                !double.IsFinite(left.Offset) || !double.IsFinite(right.Offset) ||
+                left.Slope >= 0 || right.Slope <= 0) {
+                return null;
+            }
+
+            var intersection = fitting.Intersection;
+            var points = left.DataPoints.Concat(right.DataPoints).ToList();
+            if (!IsValidHfrFocusPoint(intersection) || points.Any(p => !double.IsFinite(p.X)) ||
+                intersection.X < points.Min(p => p.X) || intersection.X > points.Max(p => p.X)) {
+                return null;
+            }
+            return intersection;
+        }
+
+        private static bool IsValidHfrFocusPoint(DataPoint point) =>
+            double.IsFinite(point.X) && point.X >= 0 && point.X <= int.MaxValue &&
+            double.IsFinite(point.Y) && point.Y > 0;
+
+        internal static DataPoint? CombineTrendMinimum(TrendlineFitting fitting, DataPoint minimum) {
+            var intersection = GetValidTrendIntersection(fitting);
+            if (!intersection.HasValue || !IsValidHfrFocusPoint(minimum)) {
+                return null;
+            }
+            return new DataPoint(Math.Round((intersection.Value.X + minimum.X) / 2),
+                (intersection.Value.Y + minimum.Y) / 2);
+        }
+
         // Distinguishes WHY ValidateCalculatedFocusPosition rejected a run so RunAutoFocus can decide whether a
         // re-centered retry is worthwhile. HfrRegression and FinalPointOutOfBounds are symptoms of a blind sweep
         // that started far from focus (e.g. a screw adjustment shoved the focuser), which re-centering the sweep on
@@ -537,7 +572,8 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
 
         // Decides whether a final-validation failure should trigger the single-shot retry that re-centers the blind
         // sweep on the just-calculated focus point. Pure so it is unit-testable without a full sweep harness.
-        internal static bool ShouldRetryFromCalculatedPoint(AutoFocusFailureMode mode, int calculatedPoint, int currentSweepCenter, bool calculatedPointRetryUsed) {
+        internal static bool ShouldRetryFromCalculatedPoint(AutoFocusFailureMode mode, int calculatedPoint, int currentSweepCenter,
+            bool calculatedPointRetryUsed, int minimumMeasuredPosition, int maximumMeasuredPosition) {
             if (calculatedPointRetryUsed) {
                 return false;
             }
@@ -546,8 +582,16 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             if (!retryEligibleMode) {
                 return false;
             }
-            // Guard a no-op / runaway re-sweep: require a valid point that differs from the center we just swept.
-            return calculatedPoint >= 0 && calculatedPoint != currentSweepCenter;
+            if (calculatedPoint < 0 || calculatedPoint == currentSweepCenter || minimumMeasuredPosition < 0 ||
+                maximumMeasuredPosition <= minimumMeasuredPosition) {
+                return false;
+            }
+            // Allow modest extrapolation for a sweep that missed focus, but never turn a rejected fit into an
+            // unbounded hardware move. The measured span follows the configured step/offset/blind-walk geometry.
+            // Use wide arithmetic so an extreme fit or large absolute focuser counter cannot overflow this guard.
+            var span = (long)maximumMeasuredPosition - minimumMeasuredPosition;
+            return calculatedPoint >= (long)minimumMeasuredPosition - span &&
+                calculatedPoint <= (long)maximumMeasuredPosition + span;
         }
 
         // Which way the blind sweep is stepping. Only meaningful when Behavior B (the directional bootstrap cap) is
@@ -1698,7 +1742,15 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     if (!goodFocusPosition) {
                         // Ensure we cancel any remaining tasks from this iteration so we can start the next
                         iterationTaskCts.Cancel();
-                        if (ShouldRetryFromCalculatedPoint(autoFocusState.LastFailureMode, autoFocusState.LastCalculatedFocusPoint, sweepCenter, calculatedPointRetryUsed)) {
+                        var primaryRegion = autoFocusState.FocusRegionStates[0];
+                        int minimumMeasuredPosition, maximumMeasuredPosition;
+                        lock (primaryRegion.SubMeasurementsLock) {
+                            var measuredPositions = primaryRegion.MeasurementsByFocuserPoint.Keys;
+                            minimumMeasuredPosition = measuredPositions.Count > 0 ? measuredPositions.Min() : initialFocusPosition;
+                            maximumMeasuredPosition = measuredPositions.Count > 0 ? measuredPositions.Max() : initialFocusPosition;
+                        }
+                        if (ShouldRetryFromCalculatedPoint(autoFocusState.LastFailureMode, autoFocusState.LastCalculatedFocusPoint,
+                            sweepCenter, calculatedPointRetryUsed, minimumMeasuredPosition, maximumMeasuredPosition)) {
                             // The sweep started too far from focus and contaminated the curve. Re-center the next
                             // sweep on the calculated focus point and re-attempt once (capped independently of the
                             // normal attempt budget, so it fires even when TotalNumberOfAttempts == 1).
@@ -1857,6 +1909,11 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
             if (profileService.ActiveProfile.FocuserSettings.AutoFocusMethod == AFMethodEnum.STARHFR) {
                 // Evaluate R² for Fittings to be above threshold
                 foreach (var autoFocusRegionState in autoFocusState.FocusRegionStates) {
+                    // Finalization can replace both the retained points and the selected model. Check the fits
+                    // that will actually drive the focuser, not the provisional fits from the live sweep.
+                    autoFocusRegionState.ApplyFinalSymmetricWindow(autoFocusState.Options.AutoFocusInitialOffsetSteps, autoFocusState.Options.AutoFocusStepSize);
+                    autoFocusRegionState.SelectBestHyperbolicModel();
+                    autoFocusRegionState.CalculateFinalFocusPoint();
                     var fittings = autoFocusRegionState.Fittings;
                     if (fittings == null) {
                         throw new Exception($"Failed to fit curve to region {autoFocusRegionState.RegionIndex}");
@@ -1912,19 +1969,15 @@ namespace NINA.Joko.Plugins.HocusFocus.AutoFocus {
                     var min = autoFocusRegionState.MeasurementsByFocuserPoint.Min(x => x.Key);
                     var max = autoFocusRegionState.MeasurementsByFocuserPoint.Max(x => x.Key);
 
-                    // Behavior A: exclude far points outside the symmetric window (per region, around its own vertex)
-                    // and refit BEFORE model selection, so a lopsided/far-from-focus sweep does not bias the final fit.
-                    autoFocusRegionState.ApplyFinalSymmetricWindow(autoFocusState.Options.AutoFocusInitialOffsetSteps, autoFocusState.Options.AutoFocusStepSize);
-                    autoFocusRegionState.SelectBestHyperbolicModel();
-                    autoFocusRegionState.CalculateFinalFocusPoint();
-                    autoFocusRegionState.ComputeLeaveOneOutStability();
-                    var finalFocusPosition = (int)Math.Round(autoFocusRegionState.FinalFocusPoint?.X ?? -1);
-                    if (finalFocusPosition < 0) {
-                        Logger.Error("Fit failed. There likely weren't enough data points with detected stars");
-                        Notification.ShowError("Fit failed. There likely weren't enough data points with detected stars");
+                    var finalFocusPoint = autoFocusRegionState.FinalFocusPoint;
+                    if (!finalFocusPoint.HasValue || !IsValidHfrFocusPoint(finalFocusPoint.Value)) {
+                        Logger.Error($"Fit failed. No valid focus point for region {autoFocusRegionState.RegionIndex}; check curve wings and detected stars");
+                        Notification.ShowError("Fit failed. Check curve wings and detected stars.");
                         autoFocusState.LastFailureMode = AutoFocusFailureMode.FitQuality;
                         return false;
                     }
+                    var finalFocusPosition = (int)Math.Round(finalFocusPoint.Value.X);
+                    autoFocusRegionState.ComputeLeaveOneOutStability();
 
                     if (finalFocusPosition < min || finalFocusPosition > max) {
                         // Defer this rejection until after the final-validation image is captured below. Record the

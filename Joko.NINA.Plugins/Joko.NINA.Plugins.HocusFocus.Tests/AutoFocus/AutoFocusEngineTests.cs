@@ -13,8 +13,10 @@ using NINA.Joko.Plugins.HocusFocus.StarDetection;
 using NINA.Joko.Plugins.HocusFocus.Utility;
 using NINA.Profile.Interfaces;
 using NINA.WPF.Base.ViewModel.AutoFocus;
+using NINA.WPF.Base.Utility.AutoFocus;
 using NSubstitute;
 using NUnit.Framework;
+using OxyPlot;
 using OxyPlot.Series;
 using System;
 using System.Collections.Generic;
@@ -463,23 +465,23 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.AutoFocus {
         public void ShouldRetryFromCalculatedPoint_HfrRegression_FirstTime_RetriesOnce() {
             // A "final HFR worse than original" failure with a usable calculated point should re-center and retry.
             Assert.That(AutoFocusEngine.ShouldRetryFromCalculatedPoint(
-                AutoFocusEngine.AutoFocusFailureMode.HfrRegression, calculatedPoint: 53929, currentSweepCenter: 54073, calculatedPointRetryUsed: false), Is.True);
+                AutoFocusEngine.AutoFocusFailureMode.HfrRegression, calculatedPoint: 53929, currentSweepCenter: 54073, calculatedPointRetryUsed: false, minimumMeasuredPosition: 53300, maximumMeasuredPosition: 54200), Is.True);
         }
 
         [Test]
         public void ShouldRetryFromCalculatedPoint_OutOfBounds_FirstTime_RetriesOnce() {
             // A "focus point outside the swept range" failure (the user's saved run) should re-center and retry.
             Assert.That(AutoFocusEngine.ShouldRetryFromCalculatedPoint(
-                AutoFocusEngine.AutoFocusFailureMode.FinalPointOutOfBounds, calculatedPoint: 53214, currentSweepCenter: 54073, calculatedPointRetryUsed: false), Is.True);
+                AutoFocusEngine.AutoFocusFailureMode.FinalPointOutOfBounds, calculatedPoint: 53214, currentSweepCenter: 54073, calculatedPointRetryUsed: false, minimumMeasuredPosition: 53300, maximumMeasuredPosition: 54200), Is.True);
         }
 
         [Test]
         public void ShouldRetryFromCalculatedPoint_SecondFailure_DoesNotRetryAgain() {
             // The calculated-point retry is single-shot: once used, a second a/c failure must NOT trigger it again.
             Assert.That(AutoFocusEngine.ShouldRetryFromCalculatedPoint(
-                AutoFocusEngine.AutoFocusFailureMode.HfrRegression, calculatedPoint: 53800, currentSweepCenter: 53929, calculatedPointRetryUsed: true), Is.False);
+                AutoFocusEngine.AutoFocusFailureMode.HfrRegression, calculatedPoint: 53800, currentSweepCenter: 53929, calculatedPointRetryUsed: true, minimumMeasuredPosition: 53300, maximumMeasuredPosition: 54200), Is.False);
             Assert.That(AutoFocusEngine.ShouldRetryFromCalculatedPoint(
-                AutoFocusEngine.AutoFocusFailureMode.FinalPointOutOfBounds, calculatedPoint: 53800, currentSweepCenter: 53929, calculatedPointRetryUsed: true), Is.False);
+                AutoFocusEngine.AutoFocusFailureMode.FinalPointOutOfBounds, calculatedPoint: 53800, currentSweepCenter: 53929, calculatedPointRetryUsed: true, minimumMeasuredPosition: 53300, maximumMeasuredPosition: 54200), Is.False);
         }
 
         [Test]
@@ -487,13 +489,13 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.AutoFocus {
             // Bad-data / bad-fit failures can't be fixed by re-centering, so they fall through to the normal budget.
             Assert.Multiple(() => {
                 Assert.That(AutoFocusEngine.ShouldRetryFromCalculatedPoint(
-                    AutoFocusEngine.AutoFocusFailureMode.FitQuality, 53929, 54073, false), Is.False);
+                    AutoFocusEngine.AutoFocusFailureMode.FitQuality, 53929, 54073, false, minimumMeasuredPosition: 53300, maximumMeasuredPosition: 54200), Is.False);
                 Assert.That(AutoFocusEngine.ShouldRetryFromCalculatedPoint(
-                    AutoFocusEngine.AutoFocusFailureMode.InitialHfrFailed, 53929, 54073, false), Is.False);
+                    AutoFocusEngine.AutoFocusFailureMode.InitialHfrFailed, 53929, 54073, false, minimumMeasuredPosition: 53300, maximumMeasuredPosition: 54200), Is.False);
                 Assert.That(AutoFocusEngine.ShouldRetryFromCalculatedPoint(
-                    AutoFocusEngine.AutoFocusFailureMode.FinalHfrMissing, 53929, 54073, false), Is.False);
+                    AutoFocusEngine.AutoFocusFailureMode.FinalHfrMissing, 53929, 54073, false, minimumMeasuredPosition: 53300, maximumMeasuredPosition: 54200), Is.False);
                 Assert.That(AutoFocusEngine.ShouldRetryFromCalculatedPoint(
-                    AutoFocusEngine.AutoFocusFailureMode.None, 53929, 54073, false), Is.False);
+                    AutoFocusEngine.AutoFocusFailureMode.None, 53929, 54073, false, minimumMeasuredPosition: 53300, maximumMeasuredPosition: 54200), Is.False);
             });
         }
 
@@ -502,10 +504,113 @@ namespace NINA.Joko.Plugins.HocusFocus.Tests.AutoFocus {
             // calc == current center (no-op re-sweep) and an invalid (<0) point must both be rejected.
             Assert.Multiple(() => {
                 Assert.That(AutoFocusEngine.ShouldRetryFromCalculatedPoint(
-                    AutoFocusEngine.AutoFocusFailureMode.HfrRegression, calculatedPoint: 54073, currentSweepCenter: 54073, calculatedPointRetryUsed: false), Is.False);
+                    AutoFocusEngine.AutoFocusFailureMode.HfrRegression, calculatedPoint: 54073, currentSweepCenter: 54073, calculatedPointRetryUsed: false, minimumMeasuredPosition: 53300, maximumMeasuredPosition: 54200), Is.False);
                 Assert.That(AutoFocusEngine.ShouldRetryFromCalculatedPoint(
-                    AutoFocusEngine.AutoFocusFailureMode.FinalPointOutOfBounds, calculatedPoint: -1, currentSweepCenter: 54073, calculatedPointRetryUsed: false), Is.False);
+                    AutoFocusEngine.AutoFocusFailureMode.FinalPointOutOfBounds, calculatedPoint: -1, currentSweepCenter: 54073, calculatedPointRetryUsed: false, minimumMeasuredPosition: 53300, maximumMeasuredPosition: 54200), Is.False);
             });
+        }
+
+        [TestCase(13442)]
+        [TestCase(0)]
+        [TestCase(int.MaxValue)]
+        public void ShouldRetryFromCalculatedPoint_ExtremeRejectedFit_DoesNotMove(int calculatedPoint) {
+            // The real 2026-10-11 run rejected 13442 outside 26827..26922, then moved there on its retry.
+            Assert.That(AutoFocusEngine.ShouldRetryFromCalculatedPoint(
+                AutoFocusEngine.AutoFocusFailureMode.FinalPointOutOfBounds, calculatedPoint, 26867, false,
+                minimumMeasuredPosition: 26827, maximumMeasuredPosition: 26922), Is.False);
+        }
+
+        [TestCase(26732, true)]
+        [TestCase(26731, false)]
+        [TestCase(27017, true)]
+        [TestCase(27018, false)]
+        public void ShouldRetryFromCalculatedPoint_ExtrapolationLimitedToOneMeasuredSpan(int calculatedPoint, bool expected) {
+            Assert.That(AutoFocusEngine.ShouldRetryFromCalculatedPoint(
+                AutoFocusEngine.AutoFocusFailureMode.FinalPointOutOfBounds, calculatedPoint, 26867, false,
+                minimumMeasuredPosition: 26827, maximumMeasuredPosition: 26922), Is.EqualTo(expected));
+        }
+
+        [Test]
+        public void ShouldRetryFromCalculatedPoint_InvalidMeasuredRange_DoesNotMove() {
+            Assert.Multiple(() => {
+                Assert.That(AutoFocusEngine.ShouldRetryFromCalculatedPoint(
+                    AutoFocusEngine.AutoFocusFailureMode.HfrRegression, 26884, 26867, false, 26867, 26867), Is.False);
+                Assert.That(AutoFocusEngine.ShouldRetryFromCalculatedPoint(
+                    AutoFocusEngine.AutoFocusFailureMode.HfrRegression, 26884, 26867, false, 26922, 26827), Is.False);
+                Assert.That(AutoFocusEngine.ShouldRetryFromCalculatedPoint(
+                    AutoFocusEngine.AutoFocusFailureMode.HfrRegression, 26884, 26867, false, -1, 26922), Is.False);
+            });
+        }
+
+        [Test]
+        public void ShouldRetryFromCalculatedPoint_LargeAbsoluteCounter_DoesNotOverflowEnvelope() {
+            Assert.That(AutoFocusEngine.ShouldRetryFromCalculatedPoint(
+                AutoFocusEngine.AutoFocusFailureMode.HfrRegression, int.MaxValue - 50, int.MaxValue - 80, false,
+                int.MaxValue - 100, int.MaxValue - 10), Is.True);
+        }
+
+        private static TrendlineFitting ValidTrendFitting() => new TrendlineFitting().Calculate(new[] {
+            new ScatterErrorPoint(26800, 3.0, 0, 0.1), new ScatterErrorPoint(26810, 2.0, 0, 0.1),
+            new ScatterErrorPoint(26820, 1.0, 0, 0.1), new ScatterErrorPoint(26830, 2.0, 0, 0.1),
+            new ScatterErrorPoint(26840, 3.0, 0, 0.1)
+        }, AFMethodEnum.STARHFR.ToString());
+
+        [Test]
+        public void CombineTrendMinimum_ValidWings_PreservesCombinedFocus() {
+            var result = AutoFocusEngine.CombineTrendMinimum(ValidTrendFitting(), new DataPoint(26822, 1.2));
+            Assert.That(result.HasValue, Is.True);
+            Assert.Multiple(() => {
+                Assert.That(result.Value.X, Is.EqualTo(26821));
+                Assert.That(result.Value.Y, Is.EqualTo(1.1).Within(1e-10));
+            });
+        }
+
+        [Test]
+        public void CombineTrendMinimum_FlatWindowDoesNotAverageZeroSentinelInto13442() {
+            // Every retained point is within 0.1 HFR of the minimum: NINA creates two empty default lines
+            // and returns (0,0). The old combined fit averaged that sentinel with 26884 to produce 13442.
+            var fitting = new TrendlineFitting().Calculate(new[] {
+                new ScatterErrorPoint(26842, 1.47, 0, 0.1), new ScatterErrorPoint(26862, 1.39, 0, 0.1),
+                new ScatterErrorPoint(26887, 1.47, 0, 0.1)
+            }, AFMethodEnum.STARHFR.ToString());
+            Assert.That(fitting.Intersection, Is.EqualTo(new DataPoint(0, 0)), "exercise NINA's actual sentinel");
+            Assert.That(AutoFocusEngine.CombineTrendMinimum(fitting, new DataPoint(26884, 1.4)), Is.Null);
+        }
+
+        [Test]
+        public void CombineTrendMinimum_ParallelOrMissingWings_IsRejected() {
+            var fitting = ValidTrendFitting();
+            fitting.LeftTrend = new Trendline(new[] { SE(26800, 2), SE(26810, 3) });
+            fitting.RightTrend = new Trendline(new[] { SE(26830, 5), SE(26840, 6) });
+            fitting.Intersection = fitting.LeftTrend.Intersect(fitting.RightTrend);
+            Assert.That(AutoFocusEngine.CombineTrendMinimum(fitting, new DataPoint(26884, 1.4)), Is.Null);
+            fitting.LeftTrend = null;
+            Assert.That(AutoFocusEngine.CombineTrendMinimum(fitting, new DataPoint(26884, 1.4)), Is.Null);
+            Assert.That(AutoFocusEngine.CombineTrendMinimum(null, new DataPoint(26884, 1.4)), Is.Null);
+        }
+
+        [TestCase(double.NaN, 1.0)]
+        [TestCase(double.PositiveInfinity, 1.0)]
+        [TestCase(0, 0)]
+        [TestCase(-1, 1.0)]
+        [TestCase(26820, double.NaN)]
+        [TestCase(26820, double.NegativeInfinity)]
+        [TestCase(26820, 0)]
+        [TestCase(26000, 1.0)]
+        public void CombineTrendMinimum_InvalidIntersection_IsRejected(double x, double y) {
+            var fitting = ValidTrendFitting();
+            fitting.Intersection = new DataPoint(x, y);
+            Assert.That(AutoFocusEngine.CombineTrendMinimum(fitting, new DataPoint(26884, 1.4)), Is.Null);
+        }
+
+        [TestCase(double.NaN, 1.0)]
+        [TestCase(double.PositiveInfinity, 1.0)]
+        [TestCase(-1, 1.0)]
+        [TestCase(26820, double.NaN)]
+        [TestCase(26820, double.PositiveInfinity)]
+        [TestCase(26820, 0)]
+        public void CombineTrendMinimum_InvalidMinimum_IsRejected(double x, double y) {
+            Assert.That(AutoFocusEngine.CombineTrendMinimum(ValidTrendFitting(), new DataPoint(x, y)), Is.Null);
         }
 
         // --- Behavior A: symmetric-window helpers (final-fit exclusion) ---
